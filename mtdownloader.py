@@ -142,7 +142,6 @@ Range: {}
             self.exception=e
         except:
             self.exception=sys.exc_info()[0]
-        self.tdev.set()
             
     def start(self):
         self.tdev=threading.Event()
@@ -150,7 +149,8 @@ Range: {}
         self.td.start()
 
     def wait(self,timeout=None):
-        if(self.tdev.wait(timeout)):
+        self.td.join(timeout)
+        if(not self.td.isAlive()):
             if(self.exception is Exception):
                 raise self.exception
             elif(self.exception):
