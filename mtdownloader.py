@@ -2,6 +2,8 @@ import requests
 import threading
 import os
 import sys
+import logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def readable(n):
     if(n<1024):
@@ -33,11 +35,18 @@ def GroupDownloader(url,fileObj,lock,L,R,ua=None,timeout=None,chunkSize=1024*102
     res=requests.get(url,headers=headers,timeout=timeout,stream=True,proxies=proxy)
     nWritten=0
     for data in res.iter_content(chunkSize):
-        if(lock.acquire()):
+        with lock:
             fileObj.seek(L+nWritten)
             fileObj.write(data)
             nWritten+=len(data)
-            lock.release()
+
+def GroupWorker(*args,**kwargs):
+    try:
+        GroupDownloader(*args,**kwargs)
+    except Exception as e:
+        return (False,e)
+    else:
+        return (True,None)
 
 class MTDownloader:
     '''Mutli-Thread Downloader
@@ -53,12 +62,13 @@ class MTDownloader:
 
     ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/72.0.3626.119 Safari/537.36'
 
-    def __init__(self,url,filename=None,overwrite=False,timeout=5,maxThread=None, chunkSize=1024*1024*10, pieceSize=1024*1024*30, thresholdSize=1024*1024*10,proxy=None,debug=False):
+    def __init__(self,url,filename=None,overwrite=False,timeout=5,maxThread=None,retryTime=2,chunkSize=1024*1024*10, pieceSize=1024*1024*30, thresholdSize=1024*1024*10,proxy=None,debug=False):
         self.url=url
         self.filename=filename
         self.overwrite=overwrite
         self.timeout=timeout
         self.maxThread=maxThread
+        self.retryTime=retryTime
         self.chunkSize=chunkSize
         self.pieceSize=pieceSize
         self.threshold=thresholdSize
@@ -82,8 +92,7 @@ class MTDownloader:
         res=requests.head(self.url,headers=headers,timeout=5,proxies=self.proxy)
         self.supported = (res.status_code==206)
 
-        if(self.debug):
-            print(r'''{}
+        logging.debug(r'''{}
 URL: {}
 Content length: {} ({})
 Filename: {}
@@ -99,40 +108,46 @@ Range: {}
 
     def _download(self):
         if(not self.supported or (self.threshold and self.length<self.threshold)):
-            if(self.debug):
-                print('calling SingleDownloader in thread {}...'.format(threading.currentThread().getName()))
-            SingleDownloader(self.url,self.filename,
-                ua=self.ua,
-                timeout=self.timeout,
-                chunkSize=self.chunkSize,
-                proxy=self.proxy)
+            logging.debug('calling SingleDownloader in thread {}...'.format(threading.currentThread().getName()))
+            nRetry=0
+            while True:
+                try:
+                    SingleDownloader(self.url,self.filename,
+                        ua=self.ua,
+                        timeout=self.timeout,
+                        chunkSize=self.chunkSize,
+                        proxy=self.proxy)
+                except Exception as e:
+                    logging.debug('{} SingleDownloader exception: {}'.format(threading.currentThread().getName(),e))
+                else:
+                    break
+                
+                nRetry+=1
+                if(nRetry<self.retryTime):
+                    logging.debug('{} retry SingleDownloader: {} of {}'.format(threading.currentThread().getName(),nRetry,self.retryTime))
+                else:
+                    raise Exception('SingleDownloader error') from e
         else:
             if(self.maxThread):
                 nThread=self.maxThread
             else:
                 nThread=self.length // self.pieceSize
+            nThread=max(nThread,1)
             lock=threading.Lock()
             jobs=[]
             with open(self.filename,'wb') as f:
-                for i in range(nThread-1):
+                for i in range(nThread):
                     L=i*self.pieceSize
-                    R=(i+1)*self.pieceSize-1
-                    thisJob=threading.Thread(target=GroupDownloader,
+                    R=min( (i+1)*self.pieceSize-1, self.length )
+                    thisJob=threading.Thread(target=GroupWorker,
                         args=(self.url,f,lock,L,R),
                         kwargs={'ua':self.ua,'timeout':self.timeout,'chunkSize':self.chunkSize,'proxy':self.proxy})
-                    if(self.debug):
-                        print('call GroupDownloader in thread {}'.format(thisJob.getName()))
+                    logging.debug('call GroupDownloader in thread {}'.format(thisJob.getName()))
                     thisJob.start()
                     jobs.append(thisJob)
-                if(self.debug):
-                    print('calling GroupDownloader in thread {}...'.format(threading.currentThread().getName()))
-                GroupDownloader(self.url,f,lock,max(nThread-1,0)*self.pieceSize,self.length,ua=self.ua,timeout=self.timeout,chunkSize=self.chunkSize,proxy=self.proxy)
-                if(self.debug):
-                    print('thread {} work done.'.format(threading.currentThread().getName()))
                 for j in jobs:
                     j.join()
-                    if(self.debug):
-                        print('thread {} work done.'.format(j.getName()))
+                    logging.debug('{} work done.'.format(j.getName()))
 
     def _work(self):
         try:
